@@ -5,6 +5,7 @@ use std::{
     time::Duration,
     process::{Command, Stdio},
     io::{Read, Write},
+    env,
 };
 
 // ターミナルの色設定
@@ -66,24 +67,75 @@ impl TerminalPane {
         
         // ターミナルスレッドを起動
         thread::spawn(move || {
-            // シェルプロセスを起動
-            let mut child = match Command::new(&shell)
-                .stdin(Stdio::piped())
+            // 環境変数を設定
+            let mut command = Command::new(&shell);
+            command.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn() {
-                    Ok(child) => child,
-                    Err(e) => {
-                        eprintln!("シェルの起動に失敗しました: {:?}", e);
+                .stderr(Stdio::piped());
+            
+            // 環境変数を設定して日本語対応
+            let path = env::var("PATH").unwrap_or_default();
+            let home = env::var("HOME").unwrap_or_default();
+            
+            command.env("PATH", path)
+                   .env("HOME", home)
+                   .env("LANG", "ja_JP.UTF-8")
+                   .env("LC_ALL", "ja_JP.UTF-8")
+                   .env("TERM", "xterm-256color");
+            
+            // シェルプロセスを起動
+            let mut child = match command.spawn() {
+                Ok(child) => {
+                    // 成功したら情報をログに出力
+                    output_tx.send(format!("ターミナルを起動しました: {}\n", shell)).ok();
+                    child
+                },
+                Err(e) => {
+                    // 詳細なエラー情報を送信
+                    let error_msg = format!("シェルの起動に失敗しました: {}\nパス: {}\n", e, shell);
+                    output_tx.send(error_msg).ok();
+                    
+                    // フォールバック: もしbashが失敗したら他のシェルを試す
+                    if shell == "/bin/bash" {
+                        // shを試す
+                        match Command::new("/bin/sh")
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn() {
+                                Ok(child) => {
+                                    output_tx.send("フォールバック: /bin/shを使用します\n".to_string()).ok();
+                                    child
+                                },
+                                Err(e2) => {
+                                    output_tx.send(format!("すべてのシェルが失敗しました: {}\n", e2)).ok();
+                                    return;
+                                }
+                            }
+                    } else {
                         return;
                     }
-                };
+                }
+            };
             
             // 標準入力へのハンドルを取得
-            let mut stdin = child.stdin.take().expect("子プロセスのstdinを取得できません");
+            let mut stdin = match child.stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    output_tx.send("子プロセスのstdinを取得できません\n".to_string()).ok();
+                    return;
+                }
+            };
             
             // 標準出力を読み取るスレッドを起動
-            let mut stdout = child.stdout.take().expect("子プロセスのstdoutを取得できません");
+            let mut stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    output_tx.send("子プロセスのstdoutを取得できません\n".to_string()).ok();
+                    return;
+                }
+            };
+            
             let output_tx_clone = output_tx.clone();
             
             thread::spawn(move || {
@@ -92,16 +144,33 @@ impl TerminalPane {
                     match stdout.read(&mut buffer) {
                         Ok(0) => break, // EOFに達した
                         Ok(n) => {
-                            let s = String::from_utf8_lossy(&buffer[..n]).to_string();
-                            output_tx_clone.send(s).ok();
+                            match String::from_utf8(buffer[..n].to_vec()) {
+                                Ok(s) => {
+                                    output_tx_clone.send(s).ok();
+                                },
+                                Err(_) => {
+                                    // UTF-8でデコードできない場合は、lossy変換を使用
+                                    let s = String::from_utf8_lossy(&buffer[..n]).to_string();
+                                    output_tx_clone.send(s).ok();
+                                }
+                            }
                         },
-                        Err(_) => break,
+                        Err(e) => {
+                            output_tx_clone.send(format!("stdout読み取りエラー: {}\n", e)).ok();
+                            break;
+                        }
                     }
                 }
             });
             
             // 標準エラー出力を読み取るスレッド
-            let mut stderr = child.stderr.take().expect("子プロセスのstderrを取得できません");
+            let mut stderr = match child.stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    output_tx.send("子プロセスのstderrを取得できません\n".to_string()).ok();
+                    return;
+                }
+            };
             
             thread::spawn(move || {
                 let mut buffer = [0; 1024];
@@ -109,10 +178,21 @@ impl TerminalPane {
                     match stderr.read(&mut buffer) {
                         Ok(0) => break, // EOFに達した
                         Ok(n) => {
-                            let s = String::from_utf8_lossy(&buffer[..n]).to_string();
-                            output_tx.send(s).ok();
+                            match String::from_utf8(buffer[..n].to_vec()) {
+                                Ok(s) => {
+                                    output_tx.send(s).ok();
+                                },
+                                Err(_) => {
+                                    // UTF-8でデコードできない場合は、lossy変換を使用
+                                    let s = String::from_utf8_lossy(&buffer[..n]).to_string();
+                                    output_tx.send(s).ok();
+                                }
+                            }
                         },
-                        Err(_) => break,
+                        Err(e) => {
+                            output_tx.send(format!("stderr読み取りエラー: {}\n", e)).ok();
+                            break;
+                        }
                     }
                 }
             });
@@ -339,17 +419,20 @@ impl TerminalPane {
                                 line.push(' ');
                             }
                             
-                            if self.cursor_pos.0 < line.len() {
-                                // 既存の文字を置き換え（安全に行う）
-                                let mut new_line = line[..self.cursor_pos.0].to_string();
-                                new_line.push(c);
-                                if self.cursor_pos.0 + 1 < line.len() {
-                                    new_line.push_str(&line[self.cursor_pos.0 + 1..]);
-                                }
-                                *line = new_line;
-                            } else {
+                            // 文字を追加（安全に行う）
+                            if self.cursor_pos.0 >= line.len() {
                                 // 新しい文字を追加
                                 line.push(c);
+                            } else {
+                                // 既存の文字列を分割して挿入
+                                let mut new_line = String::new();
+                                for (i, ch) in line.chars().enumerate() {
+                                    if i == self.cursor_pos.0 {
+                                        new_line.push(c);
+                                    }
+                                    new_line.push(ch);
+                                }
+                                *line = new_line;
                             }
                             
                             self.cursor_pos.0 += 1;
